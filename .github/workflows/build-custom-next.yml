@@ -22,6 +22,15 @@ jobs:
           node-version: 24.22.3
           architecture: x64
       - run: corepack enable
+      - name: Restore pinned upstream vendored runtime
+        shell: pwsh
+        run: |
+          $archive = Join-Path $env:RUNNER_TEMP 'dsh-desktop-upstream.zip'
+          $source = Join-Path $env:RUNNER_TEMP 'dsh-desktop-upstream'
+          curl.exe -L --fail --retry 5 --output $archive https://github.com/anywhere-labs/dsh-desktop/archive/bca69913f38ff41b7d99896331be376f94e43c8d.zip
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Expand-Archive -LiteralPath $archive -DestinationPath $source
+          Copy-Item -Path "$source/dsh-desktop-bca69913f38ff41b7d99896331be376f94e43c8d/vendor" -Destination . -Recurse -Force
       - name: Install packaging workspaces and apply custom dependency patch
         run: yarn workspaces focus dsh-desktop-next dsh-plugin-desktop dsh-community-market
       - name: Validate Windows package inputs
