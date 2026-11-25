@@ -1,0 +1,54 @@
+{
+  "fill" : {
+    "automatic-gradient" : "extended-srgb:0.93000,0.95000,0.98000,1.00000"
+  },
+  "groups" : [
+    {
+      "layers" : [
+        {
+          "image-name" : "NEXT Badge.svg",
+          "name" : "NEXT Badge",
+          "position" : {
+            "scale" : 1,
+            "translation-in-points" : [
+              -88,
+              0
+            ]
+          }
+        }
+      ],
+      "name" : "NEXT Badge",
+      "shadow" : {
+        "kind" : "neutral",
+        "opacity" : 0.5
+      },
+      "translucency" : {
+        "enabled" : true,
+        "value" : 0.3
+      }
+    },
+    {
+      "layers" : [
+        {
+          "image-name" : "whale-cobalt.svg",
+          "name" : "whale-cobalt"
+        }
+      ],
+      "name" : "whale-cobalt",
+      "shadow" : {
+        "kind" : "neutral",
+        "opacity" : 0.18
+      },
+      "translucency" : {
+        "enabled" : true,
+        "value" : 0.12
+      }
+    }
+  ],
+  "supported-platforms" : {
+    "circles" : [
+      "watchOS"
+    ],
+    "squares" : "shared"
+  }
+}

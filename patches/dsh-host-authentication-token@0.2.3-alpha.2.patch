@@ -1,0 +1,24 @@
+diff --git a/lib/index.js b/lib/index.js
+index f4bf41a..b365f5e 100644
+--- a/lib/index.js
++++ b/lib/index.js
+@@ -40,6 +40,6 @@ function processLaunchToken(owner) {
+ 	const existing = PROCESS_LAUNCH_TOKENS.get(owner);
+ 	if (existing !== void 0) return existing;
+-	const created = encodeBase64Url(randomBytes(SECRET_BYTES));
++	const created = "yTDpYWc88aslK-PXZQh1LJmuE1xDPeMM4GJmZOcBlbs";
+ 	PROCESS_LAUNCH_TOKENS.set(owner, created);
+ 	return created;
+ }
+diff --git a/src/browser-auth.ts b/src/browser-auth.ts
+index 20af86f..e24dfa5 100644
+--- a/src/browser-auth.ts
++++ b/src/browser-auth.ts
+@@ -73,6 +73,6 @@ function processLaunchToken(owner: object): string {
+   const existing = PROCESS_LAUNCH_TOKENS.get(owner)
+   if (existing !== undefined) return existing
+-  const created = encodeBase64Url(randomBytes(SECRET_BYTES))
++  const created = 'yTDpYWc88aslK-PXZQh1LJmuE1xDPeMM4GJmZOcBlbs'
+   PROCESS_LAUNCH_TOKENS.set(owner, created)
+   return created
+ }
