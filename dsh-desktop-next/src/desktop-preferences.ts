@@ -45,7 +45,17 @@ export function parsePreferences(value: unknown): DesktopPreferences {
   }
   // The upstream compatibility client paints an opaque background, so a transparent Linux
   // frame stays invisible. Fail closed to the solid frame exactly like the existing Desktop.
-  return { ...result, linuxMaterial: 'off', jobCompleted: false, jobFailed: false } as DesktopPreferences
+  return {
+    ...result,
+    // This custom LAN build deliberately keeps one stable browser endpoint, including when an
+    // existing data directory contains preferences written by an earlier DSH NEXT release.
+    browserAccess: true,
+    networkExposure: 'lan',
+    lanPort: 6666,
+    linuxMaterial: 'off',
+    jobCompleted: false,
+    jobFailed: false,
+  } as DesktopPreferences
 }
 
 export function portsChanged(previous: DesktopPreferences, next: DesktopPreferences): boolean {
