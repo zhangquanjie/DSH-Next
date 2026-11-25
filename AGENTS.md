@@ -1,0 +1,37 @@
+# DSH Desktop repository rules
+
+This repository owns the desktop product around an unmodified DeepSeek Harness checkout.
+
+## Prerequisites and setup
+
+- Use Node.js `^24.22.3` and the root Yarn `4.18.0` release through Corepack.
+- Initialize the pinned upstream checkout with `git submodule update --init --recursive`.
+- Install root dependencies with `corepack yarn install --immutable`.
+
+## Build, run, and verify
+
+- Start the desktop development workflow with `corepack yarn dev`.
+- Build the desktop package with `corepack yarn build`.
+- Root build, dev/start, and packaging commands refresh `dshmarket` from npm `latest` for Stable, Beta, and Next via `corepack yarn market:prepare`. Commit its exact dependency versions, Desktop compatibility patch, and lockfile together. `corepack yarn market:check` verifies freshness without writes; offline lookups or incompatible patches fail rather than silently retaining an old market. Installed apps do not hot-update executable plugins on launch.
+- Before each release, run `corepack yarn aa:prepare-release` to build the latest official Agents Anywhere `main` for both Desktop channels. Commit the resulting artifact, provenance, manifests, and lockfile before packaging. Signed macOS releases and root Windows distribution commands verify freshness and installed versions; `DSH_AA_SOURCE_REF=pinned` is no longer supported.
+- Run unit tests with `corepack yarn test`.
+- Run type checking with `corepack yarn typecheck`.
+- Run the complete headless gate with `corepack yarn check`.
+- `corepack yarn dev:next` explicitly launches the experimental Next app; `corepack yarn check:next` validates it without a graphical application. Next uses the official published Web frontend and the recorded upstream Desktop presentation, with product capabilities composed as a separate bundle.
+- Develop and validate Desktop feature changes in `dsh-plugin-desktop-beta/` first, then synchronize shared changes into `dsh-plugin-desktop/` while preserving declared variant differences. Before committing or pushing shared Desktop changes, run `corepack yarn check:desktop-variants` and validate both affected packages; neither package automatically inherits the other's source edits.
+- Next and Beta may follow different upstream releases: the `next` and `beta` channels in `upstream.json`. `scripts/verify-desktop-variants.mjs` lets each variant keep its own product version (the `package.json` `version` and the version pin in `tests/package.spec.ts`) whichever releases they follow, so Beta can release on its own. While the two upstream versions differ, it also treats the runtime version as a declared pair, lets each variant keep its own upstream-family pins (`@deepseek-ai/dsh*`, Cordis, Schemastery, Cosmokit) and upstream-family `dsh.optionalBundles` entries in `package.json` and its own `src/upstream-family.ts`, `src/upstream-family-labels.ts`, `src/upstream-family-preload.ts`, `src/client/upstream-family.ts`, `scripts/upstream-family.ts` and `tests/upstream-family.ts`, lets files below `src/upstream-family/`, `scripts/upstream-family/` and `tests/upstream-family/` exist in one variant only, and keeps lines between `// next-lead:start` and `// next-lead:end` in Next only. Keep every other upstream API difference behind those files or regions. A feature that needs the newer release keeps its modules, scripts and specs below those directories; the other variant's upstream-family files export the same names as `undefined`, and the shared code skips the feature. Once both follow the same release they must mirror again, apart from their product versions.
+- Run upstream operations through the root scripts, such as `corepack yarn upstream:build`.
+
+- `deepseek-harness/` is a pinned upstream Git submodule. Never edit files inside it from a desktop feature branch.
+- `dsh-plugin-desktop/` owns the Cordis Host and Client faces, Electron bootstrap, packaging, and release tests.
+- `dsh-desktop-next/` owns the separate experimental Desktop shell, Profiles and recovery, and adapters for the existing AA bridge and Community Market. Next-only changes do not belong in the Stable/Beta variant mirror. Keep its upstream reference and published runtime versions aligned; do not fork the official main frontend.
+- `dsh-community-fabric/` owns the community interoperability RFC. Until schemas and a reviewed reference adapter exist, it remains a private documentation scaffold and must not declare loadable DSH or package entry points.
+- `dsh-community-market/` owns the community-market shell. Until its runtime is implemented, it remains a private documentation scaffold and must not declare loadable DSH or package entry points.
+- `dsh-tokens-anywhere/` owns the Anywhere account plugin, `@agents-anywhere/dsh-tokens-anywhere`: Tokens Anywhere sign-in, its models and usage. No Desktop variant loads it yet; the Next and Beta Host smokes assert that it is not mounted. Keep its `@deepseek-ai/dsh*` devDependencies on Next's runtime version, which it is built and tested against. Its `engines.dsh` range declares the DSH releases it supports, and DSH refuses to install or load it outside that range; its `@deepseek-ai/dsh-credentials` peer repeats the range for package managers and DSH releases that predate `engines.dsh`. Keep the two equal with Next's version inside, and widen them to a new minor only after verifying the plugin there.
+- `dsh-acp-bridge/` owns the Agent Client Protocol (ACP) bridge plugin published as `@agents-anywhere/dsh-acp-bridge`. It loads into a running DSH of the 0.2.2 or 0.2.3 runtime family, serves ACP to local editors such as Zed through a private MeshCall endpoint and a generated stdio launcher, and drives sessions only through the official Session Controller. It is not part of the Desktop variant mirror; its headless check runs a real in-process 0.2.3 DSH Host with a scripted model. Its local RPC is a public interface, contract version 1, with a client in `@agents-anywhere/dsh-acp-bridge/client` that the launcher is built on: within a contract version changes only add fields or methods, and anything else takes the next contract version and a major release (`src/contract.ts`, `tests/unit/contract.test.ts`).
+- The outer repository and all owned packages use the root Yarn release with `nodeLinker: node-modules`.
+- The upstream submodule keeps its own pnpm workspace. Run upstream commands through the root `upstream:*` scripts, whose Yarn portable-shell commands enter the submodule before invoking Corepack.
+- Compatibility mode must run the upstream default client without overrides. Advanced presentation belongs to desktop-owned client plugins and may replace documented slots or services through profile composition.
+- Keep graphical application launch explicit. Builds, typechecks, unit tests, and Loader smokes must remain headless-safe.
+- Commit before major changes of direction and keep the submodule pin update separate from desktop behavior changes.
+- Keep the repository topology and package-manager split consistent with the [owning Agent Note](.agents/notes/implemented/process/2026-08-15-pinned-upstream-and-isolated-yarn-workspace.md).

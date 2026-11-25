@@ -1,0 +1,545 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [master]
+  push:
+    branches: [master]
+  # Pull requests and pushes package the arm64 macOS app; the universal macOS smoke runs nightly.
+  # 19:23 UTC is 03:23 in Beijing.
+  schedule:
+    - cron: '23 19 * * *'
+  workflow_dispatch:
+    inputs:
+      mac_universal:
+        description: Package the universal macOS app (both CPUs and their merge) instead of arm64 only
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  # The event keeps a push to master and the nightly universal smoke from cancelling each other.
+  group: ci-${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: true
+
+env:
+  DSH_TELEMETRY_DISABLED: '1'
+  # Yarn enables hardened mode on every public pull request and re-resolves the whole lockfile.
+  # Same-repository branches already have write access, so only fork pull requests keep it.
+  YARN_ENABLE_HARDENED_MODE: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && 'true' || 'false' }}
+  # Download versions accompany the runtime input digest computed after installing locked dependencies.
+  PACKAGING_CACHE_INPUTS: >-
+    const m = require('./' + (process.env.DSH_WINDOWS_WORKSPACE ?? 'dsh-plugin-desktop-beta') + '/package.json');
+    [m.version, 'electron' + m.devDependencies.electron, 'builder' + m.devDependencies['electron-builder'], 'pnpm' + m.dependencies.pnpm].join('-')
+
+# Pull requests only restore caches; pushes, manual runs and the nightly schedule save them. Pull
+# requests therefore never upload duplicates of master's entries or evict them from the cache budget.
+jobs:
+  # Keep required checks conclusive for documentation-only changes. Workflow
+  # path filters can leave required checks pending, so classify inside the run.
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      product: ${{ steps.scope.outputs.product }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          # GitHub's pull-request merge ref can retain the base branch's
+          # submodule gitlink when the PR advances it to a descendant. Check
+          # out the actual PR head so pinned submodules match upstream.json.
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24.22.3
+      - name: Classify changed paths
+        id: scope
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          set -euo pipefail
+          node --test scripts/bilingual-docs.test.mjs
+          node scripts/verify-bilingual-docs.mjs
+          node --test scripts/market-dependency-direction.test.mjs
+          node scripts/verify-market-dependency-direction.mjs
+          if [[ "$EVENT_NAME" == "workflow_dispatch" || -z "$BASE_SHA" || "$BASE_SHA" =~ ^0+$ ]]; then
+            product=true
+          else
+            git fetch --no-tags --depth=1 origin "$BASE_SHA"
+            git diff --check "$BASE_SHA" "$HEAD_SHA"
+            product="$(git diff --name-only -z "$BASE_SHA" "$HEAD_SHA" | node scripts/classify-ci-changes.mjs)"
+          fi
+          echo "product=$product" >> "$GITHUB_OUTPUT"
+
+  # Product gate: a documentation-only change already passed diff validation in `changes`.
+  # The nightly schedule runs only the universal macOS smoke.
+  check:
+    needs: changes
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Documentation-only gate
+        if: needs.changes.outputs.product == 'false'
+        run: echo "Documentation-only change; product build and tests are not required."
+      - uses: actions/checkout@v6
+        if: needs.changes.outputs.product == 'true'
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+          submodules: recursive
+      - uses: actions/setup-node@v6
+        if: needs.changes.outputs.product == 'true'
+        with:
+          node-version: 24.22.3
+      - if: needs.changes.outputs.product == 'true'
+        run: corepack enable
+      - name: Resolve Yarn cache folder
+        if: needs.changes.outputs.product == 'true'
+        id: yarn-cache-dir
+        run: echo "dir=$(yarn config get cacheFolder)" >> "$GITHUB_OUTPUT"
+      - name: Restore Yarn cache
+        if: needs.changes.outputs.product == 'true'
+        id: yarn-cache
+        uses: actions/cache/restore@v6
+        with:
+          path: ${{ steps.yarn-cache-dir.outputs.dir }}
+          key: yarn-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('yarn.lock', '.yarnrc.yml') }}
+          restore-keys: |
+            yarn-${{ runner.os }}-${{ runner.arch }}-
+      - if: needs.changes.outputs.product == 'true'
+        run: yarn install --immutable
+      - name: Save Yarn cache
+        if: needs.changes.outputs.product == 'true' && github.event_name != 'pull_request' && steps.yarn-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: ${{ steps.yarn-cache-dir.outputs.dir }}
+          key: ${{ steps.yarn-cache.outputs.cache-primary-key }}
+      - name: Compare the Beta and Next upstream releases
+        if: needs.changes.outputs.product == 'true'
+        id: upstream-families
+        run: |
+          node -e "const { beta: { runtimePackageVersion: beta }, next: { runtimePackageVersion: next } } = require('./upstream.json').channels; console.log('differ=' + String(beta !== next)); console.error('Beta follows ' + beta + ', Next ' + next)" >> "$GITHUB_OUTPUT"
+      # While Beta follows its own upstream release, the root check runs Beta's full check and the
+      # Beta smokes below run too. Once Beta mirrors Next, the root check runs only the Beta specs its
+      # channel-specific files can change; the variant verifier keeps that choice in step with
+      # upstream.json. The packaging jobs boot the packaged Beta Host on every OS.
+      # The login-shell specs read real zsh, bash and fish startup files with each shell the runner has;
+      # the image has only bash.
+      - name: Install zsh and fish for the login-shell specs
+        if: needs.changes.outputs.product == 'true'
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends zsh fish
+      - if: needs.changes.outputs.product == 'true'
+        run: yarn check
+      - name: Resolve Playwright version
+        if: needs.changes.outputs.product == 'true'
+        id: playwright-version
+        run: echo "version=$(node -p "require('./dsh-desktop-next/package.json').devDependencies.playwright")" >> "$GITHUB_OUTPUT"
+      - name: Restore Playwright browsers
+        if: needs.changes.outputs.product == 'true'
+        id: playwright-cache
+        uses: actions/cache/restore@v6
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ runner.arch }}-${{ steps.playwright-version.outputs.version }}
+      - name: Install Chromium for Next window regression
+        if: needs.changes.outputs.product == 'true' && steps.playwright-cache.outputs.cache-hit != 'true'
+        run: yarn workspace dsh-desktop-next exec playwright install chromium
+      - name: Save Playwright browsers
+        if: needs.changes.outputs.product == 'true' && github.event_name != 'pull_request' && steps.playwright-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: ~/.cache/ms-playwright
+          key: ${{ steps.playwright-cache.outputs.cache-primary-key }}
+      - name: Verify Next window controls, onboarding, protocol, and sidebar Browser in parallel
+        if: needs.changes.outputs.product == 'true'
+        run: |
+          node scripts/run-parallel.mjs \
+            "yarn workspace dsh-desktop-next verify:window-controls" \
+            "yarn workspace dsh-desktop-next verify:onboarding" \
+            "xvfb-run --auto-servernum yarn workspace dsh-desktop-next verify:protocol --no-sandbox" \
+            "xvfb-run --auto-servernum yarn workspace dsh-desktop-next verify:sidebar-browser --no-sandbox"
+      - name: Verify Beta window controls, onboarding, protocol, and sidebar Browser on its own upstream release
+        if: needs.changes.outputs.product == 'true' && steps.upstream-families.outputs.differ == 'true'
+        run: |
+          node scripts/run-parallel.mjs \
+            "yarn workspace dsh-plugin-desktop-beta verify:window-controls" \
+            "yarn workspace dsh-plugin-desktop-beta verify:onboarding" \
+            "xvfb-run --auto-servernum yarn workspace dsh-plugin-desktop-beta verify:protocol --no-sandbox" \
+            "xvfb-run --auto-servernum yarn workspace dsh-plugin-desktop-beta verify:sidebar-browser --no-sandbox"
+
+  # Windows on a real runner: the upstream toolchain smoke, then the unsigned NSIS build, its directory
+  # installer smoke, and the portable build.
+  # The package gate runs once; both artifacts reuse its build output.
+  desktop-windows:
+    needs: changes
+    if: needs.changes.outputs.product == 'true' && github.event_name != 'schedule'
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x64, arm64]
+        # The shared Beta payload covers both architectures on routine runs.
+        # Manual runs also build Next release candidates.
+        channel: ${{ fromJSON(github.event_name == 'workflow_dispatch' && '["beta", "next"]' || '["beta"]') }}
+        include:
+          - arch: x64
+            runner: windows-latest
+          - arch: arm64
+            runner: windows-11-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    env:
+      DSH_WINDOWS_WORKSPACE: ${{ matrix.channel == 'next' && 'dsh-desktop-next' || 'dsh-plugin-desktop-beta' }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+          submodules: recursive
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24.22.3
+          architecture: ${{ matrix.arch }}
+      - run: corepack enable
+      # The portable-shell upstream scripts must resolve the pinned submodule's own pnpm release on Windows.
+      - name: Resolve the upstream toolchain
+        run: yarn upstream:version
+      - name: Resolve Yarn cache folder
+        id: yarn-cache-dir
+        run: echo "dir=$(yarn config get cacheFolder)" >> "$env:GITHUB_OUTPUT"
+      - name: Restore Yarn cache
+        id: yarn-cache
+        uses: actions/cache/restore@v6
+        with:
+          path: ${{ steps.yarn-cache-dir.outputs.dir }}
+          key: yarn-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('yarn.lock', '.yarnrc.yml') }}
+          restore-keys: |
+            yarn-${{ runner.os }}-${{ runner.arch }}-
+      # Install only the selected channel and the shared packaging workspaces before hashing runtime inputs.
+      - name: Install the packaging workspaces
+        run: yarn workspaces focus ${{ env.DSH_WINDOWS_WORKSPACE }} dsh-plugin-desktop dsh-community-market
+      - name: Resolve packaging cache inputs
+        id: packaging-inputs
+        run: |
+          $versions = node -p $env:PACKAGING_CACHE_INPUTS
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $runtime = node "${{ env.DSH_WINDOWS_WORKSPACE }}/scripts/prepare-runtime.ts" --cache-key
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          "versions=$versions" >> $env:GITHUB_OUTPUT
+          "runtime=$runtime" >> $env:GITHUB_OUTPUT
+      - name: Restore primary runtime and Electron Builder downloads
+        id: packaging-cache
+        uses: actions/cache/restore@v6
+        with:
+          path: |
+            ${{ env.DSH_WINDOWS_WORKSPACE }}/.desktop-build/downloads
+            ${{ env.DSH_WINDOWS_WORKSPACE }}/.desktop-build/runtime
+            ~/AppData/Local/electron/Cache
+            ~/AppData/Local/electron-builder/Cache
+          key: packaging-downloads-${{ runner.os }}-${{ runner.arch }}-${{ env.DSH_WINDOWS_WORKSPACE }}-${{ steps.packaging-inputs.outputs.versions }}-${{ steps.packaging-inputs.outputs.runtime }}
+          restore-keys: |
+            packaging-downloads-${{ runner.os }}-${{ runner.arch }}-${{ env.DSH_WINDOWS_WORKSPACE }}-
+      - name: Save Yarn cache
+        if: github.event_name != 'pull_request' && steps.yarn-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: ${{ steps.yarn-cache-dir.outputs.dir }}
+          key: ${{ steps.yarn-cache.outputs.cache-primary-key }}
+      # Unit suites run on Linux; the Beta specs that only run on Windows run here.
+      - name: Run the Windows-only Beta specs
+        if: matrix.channel == 'beta'
+        run: node scripts/test-platform-specs.mjs
+      # Typecheck is platform-neutral and already gated by `check`.
+      - run: yarn workspace ${{ env.DSH_WINDOWS_WORKSPACE }} check:win-package:platform
+      # The release publishes the official Computer Use bundle's Windows provider without its helper, so packaging publishes
+      # it from the pinned upstream sources with .NET 10 and reuses the output while those sources and the script stay unchanged.
+      - name: Restore the official Windows Computer Use helper
+        id: cua-windows-helper
+        uses: actions/cache/restore@v6
+        with:
+          path: ${{ env.DSH_WINDOWS_WORKSPACE }}/.desktop-build/cua-windows
+          key: cua-windows-helper-${{ runner.os }}-${{ matrix.arch }}-${{ hashFiles('deepseek-harness/packages/experimental/cua-windows/native/Directory.Build.props', 'deepseek-harness/packages/experimental/cua-windows/native/protocol.schema.json', 'deepseek-harness/packages/experimental/cua-windows/native/entry/**', 'deepseek-harness/packages/experimental/cua-windows/native/protocol/**', format('{0}/scripts/upstream-family/cua-windows-native.ts', env.DSH_WINDOWS_WORKSPACE)) }}
+      - name: Install .NET 10 for the official Windows Computer Use helper
+        if: steps.cua-windows-helper.outputs.cache-hit != 'true'
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: '10.0.x'
+      - name: Build Windows installer
+        env:
+          DSH_PACKAGE_CHECK_ALREADY_RAN: '1'
+          # Automatic runs keep the upstream smoke cost; manual runs produce release candidates.
+          DSH_WINDOWS_PACKAGE_COMPRESSION: ${{ github.event_name == 'workflow_dispatch' && 'normal' || 'store' }}
+          # The packaging phase journal; the step after the build adds its durations to the job summary.
+          DSH_DESKTOP_PACKAGING_RUN_DIR: ${{ runner.temp }}
+        run: yarn workspace ${{ env.DSH_WINDOWS_WORKSPACE }} dist:win
+      # The installer's staged directory replacement against private directories: updates, held files,
+      # rollback, a location this account may not write to, and a payload missing an application file.
+      # It takes well under a minute; a Setup or PowerShell call that never returns fails here, not at the job limit.
+      - name: Smoke the Windows directory installer
+        timeout-minutes: 10
+        run: yarn workspace ${{ env.DSH_WINDOWS_WORKSPACE }} verify:installer-directories
+      - name: Build Windows portable archive
+        env:
+          DSH_PACKAGE_CHECK_ALREADY_RAN: '1'
+          DSH_WINDOWS_PACKAGE_COMPRESSION: ${{ github.event_name == 'workflow_dispatch' && 'normal' || 'store' }}
+          DSH_WINDOWS_REUSE_UNPACKED: '1'
+          # The packaging phase journal; the step after the build adds its durations to the job summary.
+          DSH_DESKTOP_PACKAGING_RUN_DIR: ${{ runner.temp }}
+        run: yarn workspace ${{ env.DSH_WINDOWS_WORKSPACE }} dist:win-portable
+      - name: Summarize packaging phases
+        if: ${{ !cancelled() }}
+        run: node scripts/summarize-packaging-run.mjs "${{ runner.temp }}" "Windows packaging phases"
+      - name: Save primary runtime and Electron Builder downloads
+        if: github.event_name != 'pull_request' && steps.packaging-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: |
+            ${{ env.DSH_WINDOWS_WORKSPACE }}/.desktop-build/downloads
+            ${{ env.DSH_WINDOWS_WORKSPACE }}/.desktop-build/runtime
+            ~/AppData/Local/electron/Cache
+            ~/AppData/Local/electron-builder/Cache
+          key: ${{ steps.packaging-cache.outputs.cache-primary-key }}
+      - name: Save the official Windows Computer Use helper
+        if: github.event_name != 'pull_request' && steps.cua-windows-helper.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: ${{ env.DSH_WINDOWS_WORKSPACE }}/.desktop-build/cua-windows
+          key: ${{ steps.cua-windows-helper.outputs.cache-primary-key }}
+
+      - name: Write release artifact checksums
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          $artifacts = Get-ChildItem -LiteralPath '${{ env.DSH_WINDOWS_WORKSPACE }}/dist' -File | Where-Object { $_.Name -like '*-${{ matrix.arch }}-Setup.exe' -or $_.Name -like '*-${{ matrix.arch }}-Portable.zip' }
+          if ($artifacts.Count -ne 2) { throw 'Expected one installer and one portable archive' }
+          $checksums = $artifacts | ForEach-Object { '{0}  {1}' -f (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant(), $_.Name }
+          [IO.File]::WriteAllText('${{ env.DSH_WINDOWS_WORKSPACE }}/dist/SHA256SUMS-${{ matrix.arch }}.txt', ($checksums -join "`n") + "`n", [Text.UTF8Encoding]::new($false))
+      - name: Upload Windows release candidates
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v6
+        with:
+          name: windows-${{ matrix.channel }}-${{ matrix.arch }}
+          path: |
+            ${{ env.DSH_WINDOWS_WORKSPACE }}/dist/*-${{ matrix.arch }}-Setup.exe
+            ${{ env.DSH_WINDOWS_WORKSPACE }}/dist/*-${{ matrix.arch }}-Portable.zip
+            ${{ env.DSH_WINDOWS_WORKSPACE }}/dist/SHA256SUMS-${{ matrix.arch }}.txt
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+  # Linux x64 distribution artifacts built on a stock ubuntu runner, mirroring the Windows packaging
+  # job: the unsigned AppImage, plus the Debian package outside pull requests.
+  desktop-linux:
+    needs: changes
+    if: needs.changes.outputs.product == 'true' && github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+          submodules: recursive
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24.22.3
+      - run: corepack enable
+      - name: Resolve Yarn cache folder
+        id: yarn-cache-dir
+        run: echo "dir=$(yarn config get cacheFolder)" >> "$GITHUB_OUTPUT"
+      - name: Restore Yarn cache
+        id: yarn-cache
+        uses: actions/cache/restore@v6
+        with:
+          path: ${{ steps.yarn-cache-dir.outputs.dir }}
+          key: yarn-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('yarn.lock', '.yarnrc.yml') }}
+          restore-keys: |
+            yarn-${{ runner.os }}-${{ runner.arch }}-
+      # Packaging needs Beta, the Stable scripts Beta imports and the market build. Focusing on them
+      # skips Next's dependency tree, about a third of a full install.
+      - name: Install the packaging workspaces
+        run: yarn workspaces focus dsh-plugin-desktop-beta dsh-plugin-desktop dsh-community-market
+      - name: Resolve packaging cache inputs
+        id: packaging-inputs
+        run: |
+          versions=$(node -p "$PACKAGING_CACHE_INPUTS")
+          runtime=$(node dsh-plugin-desktop-beta/scripts/prepare-runtime.ts --cache-key)
+          echo "versions=$versions" >> "$GITHUB_OUTPUT"
+          echo "runtime=$runtime" >> "$GITHUB_OUTPUT"
+      - name: Restore primary runtime and Electron Builder downloads
+        id: packaging-cache
+        uses: actions/cache/restore@v6
+        with:
+          path: |
+            dsh-plugin-desktop-beta/.desktop-build/downloads
+            dsh-plugin-desktop-beta/.desktop-build/runtime
+            ~/.cache/electron
+            ~/.cache/electron-builder
+            ~/.cache/node-gyp
+          key: packaging-downloads-${{ runner.os }}-${{ runner.arch }}-dsh-plugin-desktop-beta-${{ steps.packaging-inputs.outputs.versions }}-${{ steps.packaging-inputs.outputs.runtime }}
+          restore-keys: |
+            packaging-downloads-${{ runner.os }}-${{ runner.arch }}-dsh-plugin-desktop-beta-
+      # The check job saves the complete Yarn cache this job restores, so this job does not save a subset.
+      - run: yarn workspace dsh-plugin-desktop-beta check:linux-package:platform
+      - name: Build Linux artifacts
+        env:
+          DSH_PACKAGE_CHECK_ALREADY_RAN: '1'
+          DSH_LINUX_PACKAGE_COMPRESSION: store
+          # The Debian package takes about 100 s and its check reads only the archive header, so pull
+          # requests build the AppImage alone. Pushes to master and manual runs build both.
+          DSH_LINUX_PACKAGE_TARGETS: ${{ github.event_name == 'pull_request' && 'AppImage' || 'AppImage,deb' }}
+          # The packaging phase journal; the step after the build adds its durations to the job summary.
+          DSH_DESKTOP_PACKAGING_RUN_DIR: ${{ runner.temp }}
+        run: yarn workspace dsh-plugin-desktop-beta dist:linux
+      - name: Summarize packaging phases
+        if: ${{ !cancelled() }}
+        run: node scripts/summarize-packaging-run.mjs "${{ runner.temp }}" "Linux packaging phases"
+      - name: Save primary runtime and Electron Builder downloads
+        if: github.event_name != 'pull_request' && steps.packaging-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: |
+            dsh-plugin-desktop-beta/.desktop-build/downloads
+            dsh-plugin-desktop-beta/.desktop-build/runtime
+            ~/.cache/electron
+            ~/.cache/electron-builder
+            ~/.cache/node-gyp
+          key: ${{ steps.packaging-cache.outputs.cache-primary-key }}
+
+  # Unsigned macOS packaging smoke on a real macOS runner; the signed release is built manually on a
+  # credentialed machine and no signing secrets ever reach this job. Pull requests and pushes package
+  # the runner's native arm64 app and check it against the universal merge's x64ArchFiles rule. The
+  # merge alone takes 7-17 minutes, so the full universal app is packaged by the nightly schedule and
+  # by manual runs that ask for it.
+  desktop-macos:
+    needs: changes
+    if: needs.changes.outputs.product == 'true'
+    runs-on: macos-latest
+    timeout-minutes: 60
+    env:
+      MAC_SMOKE_ARCH: ${{ (github.event_name == 'schedule' || inputs.mac_universal) && 'universal' || 'arm64' }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+          submodules: recursive
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24.22.3
+      - run: corepack enable
+      - name: Resolve Yarn cache folder
+        id: yarn-cache-dir
+        run: echo "dir=$(yarn config get cacheFolder)" >> "$GITHUB_OUTPUT"
+      - name: Restore Yarn cache
+        id: yarn-cache
+        uses: actions/cache/restore@v6
+        with:
+          path: ${{ steps.yarn-cache-dir.outputs.dir }}
+          key: yarn-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('yarn.lock', '.yarnrc.yml') }}
+          restore-keys: |
+            yarn-${{ runner.os }}-${{ runner.arch }}-
+      # Packaging needs Beta, the Stable scripts Beta imports and the market build. Focusing on them
+      # skips Next's dependency tree, about a third of a full install.
+      - name: Install the packaging workspaces
+        run: yarn workspaces focus dsh-plugin-desktop-beta dsh-plugin-desktop dsh-community-market
+      - name: Resolve packaging cache inputs
+        id: packaging-inputs
+        run: |
+          versions=$(node -p "$PACKAGING_CACHE_INPUTS")
+          runtime=$(node dsh-plugin-desktop-beta/scripts/prepare-runtime.ts --cache-key)
+          echo "versions=$versions" >> "$GITHUB_OUTPUT"
+          echo "runtime=$runtime" >> "$GITHUB_OUTPUT"
+      - name: Restore primary runtime and Electron Builder downloads
+        id: packaging-cache
+        uses: actions/cache/restore@v6
+        with:
+          path: |
+            dsh-plugin-desktop-beta/.desktop-build/downloads
+            dsh-plugin-desktop-beta/.desktop-build/runtime
+            ~/Library/Caches/electron
+            ~/Library/Caches/electron-builder
+            ~/Library/Caches/node-gyp
+          key: packaging-downloads-${{ runner.os }}-${{ runner.arch }}-dsh-plugin-desktop-beta-${{ env.MAC_SMOKE_ARCH }}-${{ steps.packaging-inputs.outputs.versions }}-${{ steps.packaging-inputs.outputs.runtime }}
+          restore-keys: |
+            packaging-downloads-${{ runner.os }}-${{ runner.arch }}-dsh-plugin-desktop-beta-${{ env.MAC_SMOKE_ARCH }}-
+            packaging-downloads-${{ runner.os }}-${{ runner.arch }}-dsh-plugin-desktop-beta-
+      # An arm64 run that falls back to a universal entry drops its Intel payload, so the prepared
+      # arm64 runtime is reused instead of rebuilt.
+      - name: Keep only the arm64 runtime
+        if: env.MAC_SMOKE_ARCH != 'universal'
+        run: rm -rf dsh-plugin-desktop-beta/.desktop-build/runtime/x64
+      - name: Save Yarn cache
+        if: github.event_name != 'pull_request' && steps.yarn-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: ${{ steps.yarn-cache-dir.outputs.dir }}
+          key: ${{ steps.yarn-cache.outputs.cache-primary-key }}
+      # The vendored Computer Use provider ships no helper application, so every packaging run builds it
+      # from the provider's sources, both CPUs even for the arm64 app. prepareCuaNative keeps a helper it
+      # finds unless this workspace recorded building it, so a restored helper is used as is. The key
+      # covers the provider release and sources, the Beta script that invokes the builder, and Swift.
+      - name: Resolve the Computer Use helper inputs
+        id: cua-helper
+        run: |
+          dir=$(node -e "
+            const { createRequire } = require('node:module')
+            const { dirname, relative, resolve } = require('node:path')
+            try {
+              const bundle = createRequire(resolve('dsh-plugin-desktop-beta/package.json')).resolve('@deepseek-ai/dsh-cua-bundle/package.json')
+              console.log(relative(process.cwd(), dirname(createRequire(bundle).resolve('@deepseek-ai/dsh-cua-macos/package.json'))))
+            } catch { console.log('') }")
+          echo "dir=$dir" >> "$GITHUB_OUTPUT"
+          echo "swift=$(xcrun swift --version 2>&1 | shasum -a 256 | cut -c1-16)" >> "$GITHUB_OUTPUT"
+      - name: Restore the Computer Use helpers
+        id: cua-helper-cache
+        if: steps.cua-helper.outputs.dir != ''
+        uses: actions/cache/restore@v6
+        with:
+          path: ${{ steps.cua-helper.outputs.dir }}/native/bin
+          key: cua-helper-${{ runner.os }}-${{ runner.arch }}-${{ env.MAC_SMOKE_ARCH }}-${{ steps.cua-helper.outputs.swift }}-${{ hashFiles(format('{0}/package.json', steps.cua-helper.outputs.dir), format('{0}/native/**', steps.cua-helper.outputs.dir), 'dsh-plugin-desktop-beta/scripts/upstream-family/cua-native.ts') }}
+      # Unit suites run on Linux; the Beta specs with macOS-only cases run here, and so does the real
+      # login-shell spec with macOS's own zsh and bash.
+      - name: Run the macOS-only Beta specs
+        run: node scripts/test-platform-specs.mjs
+      - run: yarn workspace dsh-plugin-desktop-beta check:mac-package:platform
+      - name: Build macOS smoke artifact
+        env:
+          DSH_PACKAGE_CHECK_ALREADY_RAN: '1'
+          DSH_MAC_SMOKE_ARCH: ${{ env.MAC_SMOKE_ARCH }}
+          DSH_MAC_PACKAGE_COMPRESSION: store
+          # Pull requests verify the packaged application directory in place and skip the DMG, whose
+          # build and mount cost about 45 s. Pushes to master and manual runs build and mount it.
+          DSH_MAC_SMOKE_TARGET: ${{ github.event_name == 'pull_request' && 'dir' || 'dmg' }}
+          # The packaging phase journal; the step after the build adds its durations to the job summary.
+          DSH_DESKTOP_PACKAGING_RUN_DIR: ${{ runner.temp }}
+        run: yarn workspace dsh-plugin-desktop-beta dist:mac-smoke
+      - name: Summarize packaging phases
+        if: ${{ !cancelled() }}
+        run: node scripts/summarize-packaging-run.mjs "${{ runner.temp }}" "macOS packaging phases"
+      # The universal merge rejects a thin Mach-O file that both CPU builds share unless x64ArchFiles
+      # matches it. Checking the arm64 app finds those omissions without running the merge.
+      - name: Check the arm64 app against the universal merge rule
+        if: env.MAC_SMOKE_ARCH != 'universal'
+        run: node scripts/verify-mac-x64-arch-files.mjs dsh-plugin-desktop-beta "dsh-plugin-desktop-beta/dist/mac-smoke/mac-arm64/DSH Desktop Beta.app"
+      - name: Save the Computer Use helpers
+        if: steps.cua-helper.outputs.dir != '' && github.event_name != 'pull_request' && steps.cua-helper-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: ${{ steps.cua-helper.outputs.dir }}/native/bin
+          key: ${{ steps.cua-helper-cache.outputs.cache-primary-key }}
+      - name: Save primary runtime and Electron Builder downloads
+        if: github.event_name != 'pull_request' && steps.packaging-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: |
+            dsh-plugin-desktop-beta/.desktop-build/downloads
+            dsh-plugin-desktop-beta/.desktop-build/runtime
+            ~/Library/Caches/electron
+            ~/Library/Caches/electron-builder
+            ~/Library/Caches/node-gyp
+          key: ${{ steps.packaging-cache.outputs.cache-primary-key }}

@@ -1,0 +1,56 @@
+name: Build custom DSH NEXT
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows-x64:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    env:
+      # The custom Yarn patch changes the dependency resolution only on the cloud runner.
+      YARN_ENABLE_IMMUTABLE_INSTALLS: 'false'
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24.22.3
+          architecture: x64
+      - run: corepack enable
+      - name: Install packaging workspaces and apply custom dependency patch
+        run: yarn workspaces focus dsh-desktop-next dsh-plugin-desktop dsh-community-market
+      - name: Validate Windows package inputs
+        run: yarn workspace dsh-desktop-next check:win-package:platform
+      - name: Build Windows installer
+        env:
+          DSH_PACKAGE_CHECK_ALREADY_RAN: '1'
+          DSH_WINDOWS_PACKAGE_COMPRESSION: normal
+        run: yarn workspace dsh-desktop-next dist:win
+      - name: Build Windows portable archive
+        env:
+          DSH_PACKAGE_CHECK_ALREADY_RAN: '1'
+          DSH_WINDOWS_PACKAGE_COMPRESSION: normal
+          DSH_WINDOWS_REUSE_UNPACKED: '1'
+        run: yarn workspace dsh-desktop-next dist:win-portable
+      - name: Write checksums
+        shell: pwsh
+        run: |
+          $artifacts = Get-ChildItem dsh-desktop-next/dist -File | Where-Object Name -Match '(Setup\.exe|Portable\.zip)$'
+          if ($artifacts.Count -ne 2) { throw "Expected installer and portable archive, found $($artifacts.Count)" }
+          $checksums = $artifacts | ForEach-Object { '{0}  {1}' -f (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant(), $_.Name }
+          $checksums | Set-Content dsh-desktop-next/dist/SHA256SUMS-x64.txt
+      - uses: actions/upload-artifact@v6
+        with:
+          name: DSH-NEXT-fixed-port-token-windows-x64
+          path: |
+            dsh-desktop-next/dist/*-x64-Setup.exe
+            dsh-desktop-next/dist/*-x64-Portable.zip
+            dsh-desktop-next/dist/SHA256SUMS-x64.txt
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
