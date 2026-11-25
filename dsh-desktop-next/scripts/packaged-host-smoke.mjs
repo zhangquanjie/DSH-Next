@@ -36,9 +36,10 @@ try {
   if (state.phase !== 'ready' || failures !== 0) throw new Error(`Packaged Host did not reach ready: phase=${state.phase} failure=${state.failure}`)
   const auth = runtime.auth
   if (!auth) throw new Error('Packaged Host reported ready without native credentials')
-  // Only the native capability passes the request gate; a bare loopback browser request is refused.
+  // Browser/LAN access is enabled by default in this custom build, but a bare request must still
+  // be refused by the Host authentication layer until the fixed launch token is exchanged.
   const response = await fetch(new URL(auth.url).origin)
-  if (response.status !== 403) throw new Error(`Packaged Host exposed the application to ordinary browsers: HTTP ${String(response.status)}`)
+  if (response.status !== 401) throw new Error(`Packaged Host accepted an unauthenticated browser request: HTTP ${String(response.status)}`)
   await response.body?.cancel()
   // Diagnostics export runs a worker thread from the archive.
   const report = join(home, 'diagnostics.json')
